@@ -14,6 +14,9 @@
 #include <sys/epoll.h>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <thread>
+#include <sys/eventfd.h>
 
 // 这个文件只用来实现 Log 宏
 // 接受三个参数: 1. 日志等级; 2.要打印数据的类型; 3. 要打印的数据(不定参数)
@@ -354,9 +357,8 @@ class EventLoop;
 class Channel
 {
 private:
-    int _fd; // 要监控事件的文件描述符
-    Epoller *_epoller;
-    // EventLoop *_loop;  // ???
+    int _fd;           // 要监控事件的文件描述符
+    EventLoop *_loop;  // Channel 所属的lopp绑定
     uint32_t _events;  // 要监控的事件
     uint32_t _revents; // 实际触发的监控事件
     using EventCallback = std::function<void()>;
@@ -367,7 +369,7 @@ private:
     EventCallback _event_callback; // 任意事件触发回调函数(在特定时间回调后调用，可以用来设置一些同一操作，如: 日志...)
 
 public:
-    Channel(Epoller *epoller, int fd) : _fd(fd), _events(0), _revents(0), _epoller(epoller) {}
+    Channel(EventLoop *loop, int fd) : _fd(fd), _events(0), _revents(0), _loop(loop) {}
     int Fd() { return _fd; }
     // 获取想要监控的事件
     uint32_t Events()
@@ -561,5 +563,147 @@ public:
     }
 };
 
-void Channel::Update() { return _epoller->UpdateEvent(this); }
-void Channel::Remove() { return _epoller->RemoveEvent(this); }
+void Channel::Update() { return _loop->UpdateEvent(this); }
+void Channel::Remove() { return _loop->RemoveEvent(this); }
+
+class EventLoop
+{
+private:
+    using Functor = std::function<void()>;
+    std::thread::id _thread_id; // 线程ID
+    int _event_fd;              // eventfd唤醒IO事件监控有可能导致的阻塞(去执行新到来的可以执行的任务)
+    std::unique_ptr<Channel> _eventfd_channel;
+    Epoller _epoller;            // 进行所有描述符的事件监控(通过 epoller 这个更内层的封装)
+    std::vector<Functor> _tasks; // 任务队列
+    std::mutex _mutex;           // 实现任务池操作的线程安全
+
+private:
+    void RunAllTask()
+    {
+        std::vector<Functor> functor;
+        {
+            // 在操作 _tasks的时候要加锁
+            std::unique_lock<std::mutex> _lock(_mutex);
+            _tasks.swap(functor);
+        }
+        // functor是局部变量所以能保证任务一定在当前线程里面运行, er断言保证当前的线程是 EventLoop绑定的线程
+        for (auto &f : functor)
+        {
+            f();
+        }
+        return;
+    }
+    static int CreateEventFd() // 这个函数是为整个类服务的，不需要访问其他成员变量，所以设置成静态的
+    {
+        int efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        if (efd < 0)
+        {
+            ERR_LOG("CREATE EVENTFD FAILED!!");
+            abort(); // 让程序异常退出
+        }
+        return efd;
+    }
+    void ReadEventfd() // 不关心究竟有多少个任务，只关心 '有 or  无', 从而唤醒??
+    {
+        uint64_t res = 0; // 计数器要求是 8 字节的
+        int ret = read(_event_fd, &ret, 8);
+        if (ret < 0)
+        {
+            if (errno == EINTR || errno == EAGAIN)
+                return;
+            ERR_LOG("eventfd read error");
+            abort();
+        }
+        return;
+    }
+    // 往 eventfd 写入，后续配合 epoll 检测到 eventfd>0 --> 唤醒"阻塞"
+    void WeakUpEventFd()
+    {
+        uint64_t val = 1;
+        int ret = write(_event_fd, &val, 8);
+        if (ret < 0)
+        {
+            if (errno == EINTR || errno == EAGAIN)
+                return;
+            ERR_LOG("eventfd write error");
+            abort();
+        }
+        return;
+    }
+
+public:
+    EventLoop()
+        // 一个 EventLoop 绑定一个线程: EventLoop 在构造的时候会绑定一个线程
+        // 后续让该EvtnLoop对象只能在该线程中运行 (怎么做到的)
+        : _thread_id(std::this_thread::get_id()),
+          _event_fd(CreateEventFd()),
+          _eventfd_channel(new Channel(this, _event_fd))
+
+    {
+        // 给eventfd添加可读事件回调函数，读取eventfd事件通知次数
+        _eventfd_channel->SetReadCallback(std::bind(&EventLoop::ReadEventfd, this));
+        // 启动eventfd的读事件监控
+        _eventfd_channel->EnableRead();
+    }
+    // 三步走--事件监控--> 就绪事件处理--> 执行任务
+    void Start()
+    {
+        while (1) // 一旦启动以后循环就会独占线程
+        {
+            // 断言确保Start()在绑定线程中被调用
+            AssertInLoop();
+            // 1. 事件监控
+            std::vector<Channel *> actives;
+            _epoller.Poll(&actives);
+            // 2. 事件处理
+            for (auto &channel : actives)
+            {
+                channel->HandleEvent();
+            }
+            // 3. 执行任务
+            RunAllTask();
+        }
+    }
+    // 虽然说是Loop, 其实是判断任务是否是在当前EventLoop绑定的线程里
+    bool IsinLoop()
+    {
+        return (_thread_id == std::this_thread::get_id());
+    }
+    void AssertInLoop()
+    {
+        assert(_thread_id == std::this_thread::get_id());
+    }
+    // 判断将要执行的任务是否处于当前线程中，如果是则执行，不是则压入队列。
+    void RunInLoop(const Functor &cb)
+    {
+        if (IsinLoop())
+            return cb();
+        return QueueInLoop(cb);
+    }
+    // 把任务加入到任务队列中
+    void QueueInLoop(const Functor &cb)
+    {
+        // 任务队列虽然和当前的EventLoop对象以及线程绑定,
+        // 但是：是可能被多个线程同时持有的，所以需要加锁
+        {
+            std::unique_lock<std::mutex> _lock(_mutex);
+            _tasks.push_back(cb);
+        }
+        // 唤醒因为没有时间而造成的epoll阻塞,
+        // 往 eventfd 里面写入一个数据就会触发读就绪，就能唤醒epoll
+        WeakUpEventFd();
+    }
+
+    // 添加 / 修改描述符的监控事件
+    void UpdateEvent(Channel *channel)
+    {
+        // 通过调用 epoller 来写入内核
+        return _epoller.UpdateEvent(channel);
+    }
+
+    // 移除描述符监控事件
+    void RemoveEvent(Channel *channel)
+    {
+        return _epoller.RemoveEvent(channel);
+    }
+};
