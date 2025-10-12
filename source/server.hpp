@@ -19,6 +19,7 @@
 #include <sys/eventfd.h>
 #include <sys/timerfd.h> // 包含 timerfd_create 所需的声明
 #include <any>
+#include <condition_variable>
 
 // 这个文件只用来实现 Log 宏
 // 接受三个参数: 1. 日志等级; 2.要打印数据的类型; 3. 要打印的数据(不定参数)
@@ -225,7 +226,7 @@ public:
         }
         return true;
     }
-    bool Bind(const std::string &ip, uint16_t port)
+    bool Bind(uint16_t port, const std::string &ip)
     {
         struct sockaddr_in addr;
         addr.sin_family = AF_INET;
@@ -250,7 +251,7 @@ public:
         }
         return true;
     }
-    bool Connect(const std::string &ip, uint16_t port)
+    bool Connect(uint16_t port, const std::string &ip)
     {
         struct sockaddr_in addr;
         addr.sin_family = AF_INET;
@@ -343,17 +344,24 @@ public:
         val = 1;
         setsockopt(_sockfd, SOL_SOCKET, SO_REUSEPORT, (void *)&val, sizeof(int));
     }
-    void CreateClient(const std::string &ip, uint16_t port)
+    void CreateClient(uint16_t port, const std::string &ip)
     {
         Create();
-        Connect(ip, port);
+        Connect(port, ip);
     }
-    void CreateServer(const std::string &ip, uint16_t port)
+    bool CreateServer(uint16_t port, const std::string &ip = "0.0.0.0", bool block_flag = false)
     {
-        Create();
+        // 1. 创建套接字，2. 绑定地址，3. 开始监听，4. 设置非阻塞， 5. 启动地址重用
+        if (Create() == false)
+            return false;
+        if (block_flag)
+            NonBlock();
+        if (Bind(port, ip) == false)
+            return false;
+        if (Listen() == false)
+            return false;
         ReuseAddress();
-        Bind(ip, port);
-        Listen();
+        return true;
     }
 };
 
@@ -485,7 +493,7 @@ public:
     }
 };
 
-// 这个模块负责管理 Channel, 把描述符对应的监控事件写入内核
+// 这个模块负责管理 Channel, 把描述符对应的监控事件写入内核 -- 即：对事件进行真正的监控
 #define MAX_EPOLLEVENTS 1024
 class Epoller
 {
@@ -773,6 +781,10 @@ public:
     void TimerRefresh(uint64_t id);
     void TimerCancel(uint64_t id);
 };
+
+// 事件循环调度中心，要提供：1. 线程绑定   2. 任务队列管理   3. 定时器集成   4. 协调channel epoller模块
+// 后续对事件进行监控的时候，使用 Eventloop, Epoller是一个更底层的封装(为EventLoop提供更高层次的抽象，使Eventloop不用直接调用底层接口)
+// EventLoop内置 Epoller可对描述符进行事件监控，并且确保了线程安全
 class EventLoop
 {
 private:
@@ -780,7 +792,7 @@ private:
     std::thread::id _thread_id; // 线程ID
     int _event_fd;              // eventfd唤醒IO事件监控有可能导致的阻塞(去执行新到来的可以执行的任务)
     std::unique_ptr<Channel> _eventfd_channel;
-    Epoller _epoller;            // 进行所有描述符的事件监控(通过 epoller 这个更内层的封装)
+    Epoller _epoller;            // 进行所有描述符的事件监控(通过 epoller 这个更内层的封装，通过epoller管理Channel的事件监控)
     std::vector<Functor> _tasks; // 任务队列
     std::mutex _mutex;           // 实现任务池操作的线程安全
     TimeWheel _timer_wheel;      // 定时器模块
@@ -1222,3 +1234,87 @@ public:
         _loop->RunInLoop(std::bind(&Connection::UpgradeInLoop, this, context, conn, msg, closed, event));
     }
 };
+
+// 单独对监听套接字进行管理
+class Acceptor
+{
+private:
+    Socket _socket;   // 监听套接字
+    EventLoop *_loop; // 对监听套接字进行事件监控
+    Channel _channel; // 对监听套接字进行事件管理
+    // 获取新连接后，处理新连接的回调函数，由使用 Acceptor的服务者设置，Acceptor只负责调用
+    using AcceptCallback = std::function<void(int)>;
+    AcceptCallback _accept_callback;
+
+    // 监听套接字的读事件就绪的回调，即：1. 获取新连接，2. 调用_accpet_callback
+    void HandleRead()
+    {
+        int newfd = _socket.Accept();
+        if (newfd < 0)
+        {
+            return;
+        }
+        if (_accept_callback)
+            _accept_callback(newfd);
+    }
+    int CreateServer(int port)
+    {
+        bool ret = _socket.CreateServer(port);
+        assert(ret == true);
+        return _socket.Fd();
+    }
+
+public:
+    /*不能将启动读事件监控，放到构造函数中，必须在设置回调函数后，再去启动*/
+    /*否则有可能造成启动监控后，立即有事件，处理的时候，回调函数还没设置：新连接得不到处理，且资源泄漏*/
+    Acceptor(EventLoop *loop, int port) : _socket(CreateServer(port)), _loop(loop),
+                                          _channel(loop, _socket.Fd())
+    {
+        _channel.SetReadCallback(std::bind(&Acceptor::HandleRead, this));
+    }
+    void SetAcceptCallback(const AcceptCallback &cb) { _accept_callback = cb; }
+    void Listen() { _channel.EnableRead(); }
+};
+
+// 在创建线程的时候，实例化EventLoop，确保EventLoop是在对应的线程里面的
+class LoopThread
+{
+private:
+    /*用于实现_loop获取的同步关系，避免线程创建了，但是_loop还没有实例化之前去获取_loop*/
+    std::mutex _mutex;             // 互斥锁
+    std::condition_variable _cond; // 条件变量
+    EventLoop *_loop;              // EventLoop指针变量，这个对象需要在线程内实例化
+    std::thread _thread;           // EventLoop对应的线程
+private:
+    /*实例化 EventLoop 对象，唤醒_cond上有可能阻塞的线程，并且开始运行EventLoop模块的功能*/
+    void ThreadEntry()
+    {
+        EventLoop loop; // 实例化
+        {
+            std::unique_lock<std::mutex> lock(_mutex); // 加锁
+            _loop = &loop;
+            _cond.notify_all();
+        }
+        loop.Start();
+    }
+
+public:
+    // std::thread(&LoopThread::ThreadEntry, this)构建好一个临时对象，然后移动构造 _thread
+    LoopThread() : _loop(nullptr), _thread(std::thread(&LoopThread::ThreadEntry, this))
+    {
+    }
+
+    /*返回当前线程关联的EventLoop对象指针*/
+    EventLoop *GetLoop()
+    {
+        EventLoop *loop = nullptr;
+        {
+            std::unique_lock<std::mutex> lock(_mutex); // 加锁
+            _cond.wait(lock, [&]()
+                       { return _loop != nullptr; }); // loop为 nullptr 就一直阻塞
+            loop = _loop;
+        }
+        return loop;
+    }
+};
+
