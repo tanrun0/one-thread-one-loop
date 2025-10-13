@@ -696,6 +696,7 @@ private:
             RunTimerTask();
         }
     }
+    // 这里的定时任务就是释放连接
     void TimerAddInLoop(uint64_t id, uint32_t delay, const TaskFunc &cb)
     {
         TaskPtr pt(new TimeTask(id, delay, cb));
@@ -877,7 +878,7 @@ public:
             // 2. 事件处理
             for (auto &channel : actives)
             {
-                channel->HandleEvent();
+                channel->HandleEvent(); 
             }
             // 3. 执行任务
             RunAllTask();
@@ -1178,7 +1179,7 @@ public:
     }
     ~Connection() { DBG_LOG("RELEASE CONNECTION:%p", this); }
     int Fd() { return _sockfd; }
-    int ID() { return _conn_id; }
+    int Id() { return _conn_id; }
     bool IsConnected() { return _status == CONNECTED; }
     // 获取上下文，返回的是指针
     std::any *GetContext() { return &_context; }
@@ -1299,7 +1300,8 @@ private:
     }
 
 public:
-    // std::thread(&LoopThread::ThreadEntry, this)构建好一个临时对象，然后移动构造 _thread
+    // std::thread(&LoopThread::ThreadEntry, this)构建好一个临时对象(新线程)，然后移动构造 _thread
+    // ThreadEntry在新线程的执行流中执行，在ThreadEntry里面实例化EventLoop，所以EventLoop就绑定了对应线程
     LoopThread() : _loop(nullptr), _thread(std::thread(&LoopThread::ThreadEntry, this))
     {
     }
@@ -1318,3 +1320,139 @@ public:
     }
 };
 
+// EventLoop 线程池, 于管理多个 EventLoop 实例 和它对应的线程
+class LoopThreadPool
+{
+private:
+    int _thread_count;
+    int _nxt_idx;
+    EventLoop *_baseloop; //  主线程
+    std::vector<LoopThread *> _threads;
+    std::vector<EventLoop *> _loops;
+
+public:
+    LoopThreadPool(EventLoop *baseloop) : _thread_count(0), _nxt_idx(0), _baseloop(baseloop) {}
+    void SetThreadCount(int count) { _thread_count = count; }
+    // 创建线程
+    void Create()
+    {
+        if (_thread_count > 0)
+        {
+            _threads.resize(_thread_count);
+            _loops.resize(_thread_count);
+            for (int i = 0; i < _thread_count; i++)
+            {
+                _threads[i] = new LoopThread();
+                _loops[i] = _threads[i]->GetLoop();
+            }
+        }
+    }
+    // 轮询获取 下一个 EventLoop
+    EventLoop *NextLoop()
+    {
+        // 如果没有从属线程，则把新连接给主线程
+        if (_thread_count == 0)
+            return _baseloop;
+        // 如果有，则把获取的新连接轮询分配给从属线程
+        _nxt_idx = (_nxt_idx + 1) % _thread_count;
+        return _loops[_nxt_idx];
+    }
+};
+
+// 主线程负责监听与接收新连接，从属线程负责处理连接的 I/O 事件与业务逻辑
+// 该模块负责: 整合上面的所有模块，用于更加便利的搭建出服务器
+class TcpServer
+{
+private:
+    uint64_t _next_id;                                  // 自动增长的ID (即可以用于连接 ID ,也可以用于定时任务ID， 能标识唯一性即可)
+    int _port;
+    int _timeout;                                       // _timeout 长时间无通信就是非活跃连接
+    bool _enable_inactive_release;                      // 是否启动了非活跃连接超时销毁的判断标志
+    EventLoop _baseloop;                                // 这是主线程的EventLoop对象，负责监听事件的处理
+    Acceptor _acceptor;                                 // 这是监听套接字的管理对象
+    LoopThreadPool _pool;                               // 这是从属EventLoop线程池
+    std::unordered_map<uint64_t, PtrConnection> _conns; // 管理所有连接对应的shared_ptr对象
+
+    // 连接的各种回调函数设置
+    // Connection 内部会给回调函数设置固定的动作，外部服务器还可以自己设置回调函数来添加行为 
+    // 用户自定义的业务回调，是在TcpServer里面提供接口给外部设置的
+    using ConnectedCallback = std::function<void(const PtrConnection &)>;
+    using MessageCallback = std::function<void(const PtrConnection &, Buffer *)>;
+    using ClosedCallback = std::function<void(const PtrConnection &)>;
+    using AnyEventCallback = std::function<void(const PtrConnection &)>;
+    using Functor = std::function<void()>;
+    ConnectedCallback _connected_callback;
+    MessageCallback _message_callback;
+    ClosedCallback _closed_callback;
+    AnyEventCallback _event_callback;
+
+private:
+    // 添加定时任务接口
+    void RunAfterInLoop(const Functor &task, int delay)
+    {
+        _next_id++;
+        _baseloop.TimerAdd(_next_id, delay, task);
+    }
+    // 为新连接构造一个Connection进行管理
+    void NewConnection(int fd)
+    {
+        _next_id++;
+        PtrConnection conn(new Connection(_pool.NextLoop(), _next_id, fd));
+        conn->SetMessageCallback(_message_callback);
+        conn->SetClosedCallback(_closed_callback);
+        conn->SetConnectedCallback(_connected_callback);
+        conn->SetAnyEventCallback(_event_callback);
+        conn->SetSrvClosedCallback(std::bind(&TcpServer::RemoveConnection, this, std::placeholders::_1));
+        if (_enable_inactive_release)
+            conn->EnableInactiveRelease(_timeout); // 启动非活跃超时销毁
+        conn->Established();                       // 就绪初始化
+        _conns.insert(std::make_pair(_next_id, conn));
+    }
+    void RemoveConnectionInLoop(const PtrConnection &conn)
+    {
+        int id = conn->Id();
+        auto it = _conns.find(id);
+        if (it != _conns.end())
+        {
+            _conns.erase(it);
+        }
+    }
+    // 从管理Connection的_conns中移除连接信息
+    // 要确保是在指定的线程里的，所以用到RunInLoop，但是具体的操作由RemoveConnectionInLoop接口提供
+    void RemoveConnection(const PtrConnection &conn)
+    {
+        _baseloop.RunInLoop(std::bind(&TcpServer::RemoveConnectionInLoop, this, conn));
+    }
+
+public:
+    TcpServer(int port) : _port(port),
+                          _next_id(0),
+                          _enable_inactive_release(false),
+                          _acceptor(&_baseloop, port),
+                          _pool(&_baseloop)
+    {
+        _acceptor.SetAcceptCallback(std::bind(&TcpServer::NewConnection, this, std::placeholders::_1));
+        _acceptor.Listen(); // 将监听套接字挂到baseloop上
+    }
+    void SetThreadCount(int count) { return _pool.SetThreadCount(count); }
+    void SetConnectedCallback(const ConnectedCallback &cb) { _connected_callback = cb; }
+    void SetMessageCallback(const MessageCallback &cb) { _message_callback = cb; }
+    void SetClosedCallback(const ClosedCallback &cb) { _closed_callback = cb; }
+    void SetAnyEventCallback(const AnyEventCallback &cb) { _event_callback = cb; }
+    void EnableInactiveRelease(int timeout)
+    {
+        _timeout = timeout;
+        _enable_inactive_release = true;
+    }
+    // 用于添加一个定时任务
+    void RunAfter(const Functor &task, int delay)
+    {
+        _baseloop.RunInLoop(std::bind(&TcpServer::RunAfterInLoop, this, task, delay));
+    }
+    void Start()
+    {
+        // 服务器启动: 1. 启动线程池, 2. 启动主线程的事件循环处理调度
+        _pool.Create();
+        _baseloop.Start();
+    }
+};
