@@ -1,5 +1,5 @@
-test:day1.cpp
-	g++ -o $@ $^
+client6:client6.cpp
+	g++ -o $@ $^ -std=c++17
 .PHONY:clean
 clean:
-	rm -f test
+	rm -rf client6

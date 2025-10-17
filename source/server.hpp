@@ -29,7 +29,7 @@
 #define DBG 1
 #define ERR 2
 
-#define LOGLEVEL INF
+#define LOGLEVEL DBG
 
 // 日志宏
 // 宏定义的 '\'最好是行尾最后一个字符，和后面的换行符之间最后不要有空格
@@ -50,7 +50,7 @@
 #define DBG_LOG(format, ...) LOG(DBG, format, ##__VA_ARGS__)
 #define ERR_LOG(format, ...) LOG(ERR, format, ##__VA_ARGS__)
 
-// 缓冲区模块
+// 缓冲区模块，提供更便利的数据管理和操作接口，不涉及与任何业务(如网络, 文件)的绑定
 #define DEFAULT_BUFFER_CAPACITY 1024
 class Buffer
 {
@@ -92,6 +92,8 @@ public:
         else
         {
             // 简单一点直接扩容 len （可能多扩，不是刚刚好）
+            DBG_LOG("RESIZE %ld", _writer_idx + len);
+
             _buffer.resize(_writer_idx + len);
         }
     }
@@ -397,6 +399,8 @@ public:
         _revents = events;
     }
     // 设置各种事件的回调函数
+    // 具体设置什么样的回调函数，是由外面自己设置的
+    // 如 1. 监听套接字的读就绪: 获取新连接；2. 普通套接字: 把数据给服务端处理; 3. 时间轮: 读取超时次数(时间)并批量执行对应时间格的定时(超时)任务
     void SetReadCallback(const EventCallback &cb)
     {
         _read_callback = cb;
@@ -481,14 +485,14 @@ public:
         else if (_revents & EPOLLERR)
         {
             if (_error_callback)
-                _error_callback(); // 一旦出错，就会释放连接，因此要放到前边调用任意回调
+                _error_callback();
         }
         else if (_revents & EPOLLHUP)
         {
             if (_close_callback)
                 _close_callback();
         }
-        if (_event_callback)
+        if (_event_callback) // 就算前面的时间 释放了连接，也不会立即释放，因此这里不会访问到释放的 Connection
             _event_callback();
     }
 };
@@ -513,8 +517,26 @@ private:
         int ret = epoll_ctl(_epfd, op, fd, &ev);
         if (ret < 0)
         {
-            ERR_LOG("epoll_ctl error");
-            abort(); // 程序直接退出，方便调试
+            // 原来的
+            // ERR_LOG("epoll_ctl error");
+            // abort(); // 程序直接退出，方便调试
+            int err = errno;
+            // 在某些 race 情况下，fd 已经被关闭或未被添加到 epoll，会导致 EPOLL_CTL_DEL/EPOLL_CTL_MOD 失败。
+            // 这些情况不应导致整个进程 abort。只记录日志并返回即可。
+            if (op == EPOLL_CTL_DEL && (err == ENOENT || err == EBADF))
+            {
+                // fd 已经不在 epoll 中或无效，忽略
+                ERR_LOG("epoll_ctl DEL ignored: %s", strerror(err));
+                return;
+            }
+            if (op == EPOLL_CTL_ADD && err == EEXIST)
+            {
+                // 已存在，尝试改为 MOD
+                if (epoll_ctl(_epfd, EPOLL_CTL_MOD, fd, &ev) == 0)
+                    return;
+            }
+            ERR_LOG("epoll_ctl error: %s", strerror(err));
+            return;
         }
         return;
     }
@@ -678,7 +700,7 @@ private:
     {
         uint64_t times;
         // 有可能因为其他描述符的事件处理花费事件比较长，然后在处理定时器描述符事件的时候，有可能就已经超时了很多次
-        // read读取到的数据times就是从上一次read之后超时的次数
+        // read 读取到的数据 times 就是从上一次 read 之后超时的次数
         int ret = read(_timerfd, &times, 8);
         if (ret < 0)
         {
@@ -689,7 +711,7 @@ private:
     }
     void OnTime()
     {
-        // 根据实际超时的次数，执行对应的超时任务
+        // 根据实际超时的次数，执行对应的超时任务，超时times秒，就要把超时的任务全部执行了
         int times = ReadTimefd();
         for (int i = 0; i < times; i++)
         {
@@ -735,7 +757,8 @@ public:
         : _capacity(60), _tick(0), _wheel(_capacity), _loop(loop),
           _timerfd(CreateTimerfd()), _timerfd_channel(new Channel(_loop, _timerfd))
     {
-        _timerfd_channel->SetReadCallback(std::bind(&TimeWheel::ReadTimefd, this));
+        // 当 timerfd 可读时，应当执行 OnTime 来读取触发次数并跑时间轮。
+        _timerfd_channel->SetReadCallback(std::bind(&TimeWheel::OnTime, this));
         _timerfd_channel->EnableRead();
     }
     void AddTimer(uint64_t id, uint32_t delay, TaskFunc cb)
@@ -878,7 +901,7 @@ public:
             // 2. 事件处理
             for (auto &channel : actives)
             {
-                channel->HandleEvent(); 
+                channel->HandleEvent();
             }
             // 3. 执行任务
             RunAllTask();
@@ -971,9 +994,9 @@ private:
     Channel _channel;
     Socket _socket;
     ConnStatu _status;
-    Buffer _in_buffer;
+    Buffer _in_buffer; // (针对网络连接的数据暂存区)单次读取到的数可能是不完整的，所以需要缓冲区来临时存储
     Buffer _out_buffer;
-    std::any _context; // ??? 保存与当前业务相关的 "特有" 信息
+    std::any _context; // 上下文: 保存当前的状态, 解析阶段等...信息
 
     // 这四个回调函数，是让服务器模块来设置的（其实服务器模块的处理回调也是组件使用者设置的）
     // 换句话说，这几个回调都是组件使用者使用的*/
@@ -1098,7 +1121,8 @@ private:
         if (_server_closed_callback)
             _server_closed_callback(shared_from_this());
     }
-    // 只是把数据发送到缓冲区
+    // 只是把数据发送到缓冲区，然后启动写事件监控（此时就启动了发送流程）
+    // 底层会由 epoll 监控，触发写事件以后，调用回调函数，即：用 Socket 把数据写入发送套接字的发送缓冲区，最终由内核进行发送
     void SendInLoop(Buffer &buf)
     {
         if (_status == DISCONNECTED)
@@ -1130,6 +1154,7 @@ private:
         // 没有待发送数据，直接关闭
         if (_out_buffer.ReadAbleSize() == 0)
         {
+            // 这才是关闭连接的真正执行层
             Release();
         }
     }
@@ -1152,7 +1177,7 @@ private:
             _loop->TimerCancel(_conn_id);
         }
     }
-    // ??? 协议切换, 如(HTTP 切换 到 WebServer )
+    // 协议切换, 如(HTTP 切换 到 WebServer )
     void UpgradeInLoop(const std::any &context,
                        const ConnectedCallback &conn,
                        const MessageCallback &msg,
@@ -1183,6 +1208,8 @@ public:
     bool IsConnected() { return _status == CONNECTED; }
     // 获取上下文，返回的是指针
     std::any *GetContext() { return &_context; }
+    // 设置上下文--连接建立完成时进行调用
+    void SetContext(const std::any &context) { _context = context; }
     void SetConnectedCallback(const ConnectedCallback &cb) { _connected_callback = cb; }
     void SetMessageCallback(const MessageCallback &cb) { _message_callback = cb; }
     void SetClosedCallback(const ClosedCallback &cb) { _closed_callback = cb; }
@@ -1196,8 +1223,7 @@ public:
         // 通过绑定到 RunInLoop中，确保线程安全
         _loop->RunInLoop(std::bind(&Connection::EstablishedInLoop, this));
     }
-    // 发送数据
-    // 发送数据，将数据放到发送缓冲区，启动写事件监控
+    // 发送数据，将数据放到发送(连接的)缓冲区，启动写事件监控
     void Send(const char *data, size_t len)
     {
         // 外界传入的data，可能是个临时的空间，我们现在只是把发送操作压入了任务池，有可能并没有被立即执行
@@ -1206,12 +1232,12 @@ public:
         buf.WriteAndPush(data, len);
         _loop->RunInLoop(std::bind(&Connection::SendInLoop, this, std::move(buf)));
     }
-    // 为待释放的连接处理剩余数据
+    // 主动关闭连接, 但是 Shutdown 只负责启动这个流程，会处理剩余数据... 真正的关闭由Release来
     void Shutdown()
     {
         _loop->RunInLoop(std::bind(&Connection::ShutdownInLoop, this));
     }
-    // 释放连接
+    // 释放连接(把释放任务压入任务池，不然:如果当前还有Connection的其他任务在执行，直接释放就会导致错误)
     void Release()
     {
         _loop->QueueInLoop(std::bind(&Connection::ReleaseInLoop, this));
@@ -1364,7 +1390,7 @@ public:
 class TcpServer
 {
 private:
-    uint64_t _next_id;                                  // 自动增长的ID (即可以用于连接 ID ,也可以用于定时任务ID， 能标识唯一性即可)
+    uint64_t _next_id; // 自动增长的ID (即可以用于连接 ID ,也可以用于定时任务ID， 能标识唯一性即可)
     int _port;
     int _timeout;                                       // _timeout 长时间无通信就是非活跃连接
     bool _enable_inactive_release;                      // 是否启动了非活跃连接超时销毁的判断标志
@@ -1374,7 +1400,7 @@ private:
     std::unordered_map<uint64_t, PtrConnection> _conns; // 管理所有连接对应的shared_ptr对象
 
     // 连接的各种回调函数设置
-    // Connection 内部会给回调函数设置固定的动作，外部服务器还可以自己设置回调函数来添加行为 
+    // Connection 内部会给回调函数设置固定的动作，外部服务器还可以自己设置回调函数来添加行为
     // 用户自定义的业务回调，是在TcpServer里面提供接口给外部设置的
     using ConnectedCallback = std::function<void(const PtrConnection &)>;
     using MessageCallback = std::function<void(const PtrConnection &, Buffer *)>;
